@@ -49,95 +49,67 @@ std::array<unsigned char, 256> init_translation_table();
 static const std::array<unsigned char, 256> cost_translation_table__ =
     init_translation_table();
 
-Costmap2DClient::Costmap2DClient(rclcpp::Node& node, const tf2_ros::Buffer* tf)
-  : tf_(tf), node_(node)
+Costmap2DClient::Costmap2DClient(rclcpp_lifecycle::LifecycleNode& node,
+                                 const tf2_ros::Buffer* tf,
+                                 const std::string& costmap_topic,
+                                 const std::string& costmap_updates_topic,
+                                 const std::string& robot_base_frame,
+                                 double transform_tolerance)
+  : tf_(tf)
+  , node_(node)
+  , costmap_topic_(costmap_topic)
+  , costmap_updates_topic_(costmap_updates_topic)
+  , robot_base_frame_(robot_base_frame)
+  , transform_tolerance_(transform_tolerance)
 {
-  std::string costmap_topic;
-  std::string costmap_updates_topic;
+}
 
-  node_.declare_parameter<std::string>("costmap_topic", std::string("costmap"));
-  node_.declare_parameter<std::string>("costmap_updates_topic",
-                                       std::string("costmap_updates"));
-  node_.declare_parameter<std::string>("robot_base_frame", std::string("base_"
-                                                                       "link"));
-  // transform tolerance is used for all tf transforms here
-  node_.declare_parameter<double>("transform_tolerance", 0.3);
-
-  node_.get_parameter("costmap_topic", costmap_topic);
-  node_.get_parameter("costmap_updates_topic", costmap_updates_topic);
-  node_.get_parameter("robot_base_frame", robot_base_frame_);
-  node_.get_parameter("transform_tolerance", transform_tolerance_);
-
+void Costmap2DClient::configure()
+{
   /* initialize costmap */
   costmap_sub_ = node_.create_subscription<nav_msgs::msg::OccupancyGrid>(
-      costmap_topic, 1000,
+      costmap_topic_, 1000,
       [this](const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
         costmap_received_ = true;
         updateFullMap(msg);
       });
 
-  // ROS1 CODE
-  // auto costmap_msg =
-  // ros::topic::waitForMessage<nav_msgs::msg::OccupancyGrid>(
-  //     costmap_topic, subscription_nh);
-
-  // Spin some until the callback gets called to replicate
-  // ros::topic::waitForMessage
-  RCLCPP_INFO(node_.get_logger(),
-              "Waiting for costmap to become available, topic: %s",
-              costmap_topic.c_str());
-  while (!costmap_received_) {
-    rclcpp::spin_some(node_.get_node_base_interface());
-    // Wait for a second
-    usleep(1000000);
-  }
-  // updateFullMap(costmap_msg); // this is already called in the callback of
-  // the costmap_sub_
-
   /* subscribe to map updates */
   costmap_updates_sub_ =
       node_.create_subscription<map_msgs::msg::OccupancyGridUpdate>(
-          costmap_updates_topic, 1000,
+          costmap_updates_topic_, 1000,
           [this](const map_msgs::msg::OccupancyGridUpdate::SharedPtr msg) {
             updatePartialMap(msg);
           });
+}
 
-  // ROS1 CODE.
-  // TODO: Do we need this?
-  /* resolve tf prefix for robot_base_frame */
-  // std::string tf_prefix = tf::getPrefixParam(node_);
-  // robot_base_frame_ = tf::resolve(tf_prefix, robot_base_frame_);
-
-  // we need to make sure that the transform between the robot base frame and
-  // the global frame is available
-
-  // the global frame is set in the costmap callback. This is why we need to
-  // ensure that a costmap is received
-
-  /* tf transform is necessary for getRobotPose */
-  auto last_error = node_.now();
-  std::string tf_error;
-  while (rclcpp::ok() &&
-         !tf_->canTransform(global_frame_, robot_base_frame_,
-                            tf2::TimePointZero, tf2::durationFromSec(0.1),
-                            &tf_error)) {
-    rclcpp::spin_some(node_.get_node_base_interface());
-    if (last_error + tf2::durationFromSec(5.0) < node_.now()) {
-      RCLCPP_WARN(node_.get_logger(),
-                  "Timed out waiting for transform from %s to %s to become "
-                  "available "
-                  "before subscribing to costmap, tf error: %s",
-                  robot_base_frame_.c_str(), global_frame_.c_str(),
-                  tf_error.c_str());
-      last_error = node_.now();
-      ;
-    }
-    // The error string will accumulate and errors will typically be the same,
-    // so the last
-    // will do for the warning above. Reset the string here to avoid
-    // accumulation.
-    tf_error.clear();
+bool Costmap2DClient::isReady()
+{
+  if (!costmap_received_) {
+    RCLCPP_INFO_THROTTLE(node_.get_logger(), *node_.get_clock(), 1000,
+                         "Waiting for costmap to become available, topic: %s",
+                         costmap_topic_.c_str());
+    return false;
   }
+
+  std::string tf_error;
+  if (!tf_->canTransform(global_frame_, robot_base_frame_,
+                         tf2::TimePointZero, tf2::durationFromSec(0.1),
+                         &tf_error)) {
+    RCLCPP_INFO_THROTTLE(node_.get_logger(), *node_.get_clock(), 1000,
+                         "Waiting for transform from %s to %s to become available, tf error: %s",
+                         robot_base_frame_.c_str(), global_frame_.c_str(),
+                         tf_error.c_str());
+    return false;
+  }
+
+  return true;
+}
+
+void Costmap2DClient::cleanup()
+{
+  costmap_sub_.reset();
+  costmap_updates_sub_.reset();
 }
 
 void Costmap2DClient::updateFullMap(

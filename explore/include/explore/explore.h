@@ -54,6 +54,8 @@
 #include <string>
 #include <vector>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include <rclcpp_lifecycle/lifecycle_publisher.hpp>
 
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -73,18 +75,30 @@ namespace explore
  * @brief A class adhering to the robot_actions::Action interface that moves the
  * robot base to explore its environment.
  */
-class Explore : public rclcpp::Node
+class Explore : public rclcpp_lifecycle::LifecycleNode
 {
 public:
-  Explore();
+  explicit Explore(const rclcpp::NodeOptions & options);
   ~Explore();
-
-  void start();
-  void stop(bool finished_exploring = false);
-  void resume();
 
   using NavigationGoalHandle =
       rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>;
+
+protected:
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_configure(const rclcpp_lifecycle::State &);
+
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_activate(const rclcpp_lifecycle::State & state);
+
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_deactivate(const rclcpp_lifecycle::State & state);
+
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_cleanup(const rclcpp_lifecycle::State &);
+
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+  on_shutdown(const rclcpp_lifecycle::State &);
 
 private:
   /**
@@ -107,16 +121,16 @@ private:
   void reachedGoal(const NavigationGoalHandle::WrappedResult& result,
                    const geometry_msgs::msg::Point& frontier_goal);
 
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+  rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       marker_array_publisher_;
   rclcpp::Logger logger_ = rclcpp::get_logger("ExploreNode");
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
 
-  Costmap2DClient costmap_client_;
+  std::shared_ptr<Costmap2DClient> costmap_client_;
   rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr
       move_base_client_;
-  frontier_exploration::FrontierSearch search_;
+  std::shared_ptr<frontier_exploration::FrontierSearch> search_;
   rclcpp::TimerBase::SharedPtr exploring_timer_;
   // rclcpp::TimerBase::SharedPtr oneshot_;
 
@@ -140,7 +154,7 @@ private:
   bool return_to_init_;
   std::string robot_base_frame_;
   bool resuming_ = false;
-};
+};;
 }  // namespace explore
 
 #endif

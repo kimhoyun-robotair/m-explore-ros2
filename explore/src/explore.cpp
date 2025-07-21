@@ -51,14 +51,23 @@ inline static bool same_point(const geometry_msgs::msg::Point& one,
 
 namespace explore
 {
-Explore::Explore()
-  : Node("explore_node")
+Explore::Explore(const rclcpp::NodeOptions & options)
+  : rclcpp_lifecycle::LifecycleNode("explore_node", options)
   , tf_buffer_(this->get_clock())
   , tf_listener_(tf_buffer_)
-  , costmap_client_(*this, &tf_buffer_)
   , prev_distance_(0)
   , last_markers_count_(0)
 {
+}
+
+Explore::~Explore()
+{
+}
+
+rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+Explore::on_configure(const rclcpp_lifecycle::State &)
+{
+  RCLCPP_INFO(logger_, "Configuring");
   double timeout;
   double min_frontier_size;
   this->declare_parameter<float>("planner_frequency", 1.0);
@@ -69,6 +78,11 @@ Explore::Explore()
   this->declare_parameter<float>("gain_scale", 1.0);
   this->declare_parameter<float>("min_frontier_size", 0.5);
   this->declare_parameter<bool>("return_to_init", false);
+  this->declare_parameter<std::string>("robot_base_frame", "base_footprint");
+
+  this->declare_parameter<std::string>("costmap_topic", "map");
+  this->declare_parameter<std::string>("costmap_updates_topic", "map_updates");
+  this->declare_parameter<double>("transform_tolerance", 0.3);
 
   this->get_parameter("planner_frequency", planner_frequency_);
   this->get_parameter("progress_timeout", timeout);
@@ -80,36 +94,56 @@ Explore::Explore()
   this->get_parameter("return_to_init", return_to_init_);
   this->get_parameter("robot_base_frame", robot_base_frame_);
 
+  std::string costmap_topic, costmap_updates_topic;
+  double transform_tolerance;
+  this->get_parameter("costmap_topic", costmap_topic);
+  this->get_parameter("costmap_updates_topic", costmap_updates_topic);
+  this->get_parameter("transform_tolerance", transform_tolerance);
+
   progress_timeout_ = timeout;
+
+  costmap_client_ = std::make_shared<Costmap2DClient>(
+      *this, &tf_buffer_, costmap_topic, costmap_updates_topic,
+      robot_base_frame_, transform_tolerance);
+  costmap_client_->configure();
+
+  search_ = std::make_shared<frontier_exploration::FrontierSearch>(
+      costmap_client_->getCostmap(), potential_scale_, gain_scale_,
+      min_frontier_size);
+
+  if (visualize_) {
+    marker_array_publisher_ =
+        this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "explore/frontiers", 10);
+  }
+
   move_base_client_ =
       rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(
           this, ACTION_NAME);
 
-  search_ = frontier_exploration::FrontierSearch(costmap_client_.getCostmap(),
-                                                 potential_scale_, gain_scale_,
-                                                 min_frontier_size);
+  exploring_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds((uint16_t)(1000.0 / planner_frequency_)),
+      [this]() { makePlan(); });
+  // Don't start the timer yet
+  exploring_timer_->cancel();
 
+  return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::
+      CallbackReturn::SUCCESS;
+}
+
+rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+Explore::on_activate(const rclcpp_lifecycle::State & state)
+{
+  RCLCPP_INFO(logger_, "Activating");
+  LifecycleNode::on_activate(state);
   if (visualize_) {
-    marker_array_publisher_ =
-        this->create_publisher<visualization_msgs::msg::MarkerArray>("explore/"
-                                                                     "frontier"
-                                                                     "s",
-                                                                     10);
+    marker_array_publisher_->on_activate();
   }
-
-  // Subscription to resume or stop exploration
-  resume_subscription_ = this->create_subscription<std_msgs::msg::Bool>(
-      "explore/resume", 10,
-      std::bind(&Explore::resumeCallback, this, std::placeholders::_1));
-
-  RCLCPP_INFO(logger_, "Waiting to connect to move_base nav2 server");
-  move_base_client_->wait_for_action_server();
-  RCLCPP_INFO(logger_, "Connected to move_base nav2 server");
 
   if (return_to_init_) {
     RCLCPP_INFO(logger_, "Getting initial pose of the robot");
     geometry_msgs::msg::TransformStamped transformStamped;
-    std::string map_frame = costmap_client_.getGlobalFrameID();
+    std::string map_frame = costmap_client_->getGlobalFrameID();
     try {
       transformStamped = tf_buffer_.lookupTransform(
           map_frame, robot_base_frame_, tf2::TimePointZero);
@@ -126,22 +160,48 @@ Explore::Explore()
   exploring_timer_ = this->create_wall_timer(
       std::chrono::milliseconds((uint16_t)(1000.0 / planner_frequency_)),
       [this]() { makePlan(); });
-  // Start exploration right away
   makePlan();
+
+  return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::
+      CallbackReturn::SUCCESS;
 }
 
-Explore::~Explore()
+rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+Explore::on_deactivate(const rclcpp_lifecycle::State & state)
 {
-  stop();
-}
-
-void Explore::resumeCallback(const std_msgs::msg::Bool::SharedPtr msg)
-{
-  if (msg->data) {
-    resume();
-  } else {
-    stop();
+  RCLCPP_INFO(logger_, "Deactivating");
+  LifecycleNode::on_deactivate(state);
+  exploring_timer_->cancel();
+  move_base_client_->async_cancel_all_goals();
+  if (visualize_) {
+    marker_array_publisher_->on_deactivate();
   }
+  return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::
+      CallbackReturn::SUCCESS;
+}
+
+rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+Explore::on_cleanup(const rclcpp_lifecycle::State &)
+{
+  RCLCPP_INFO(logger_, "Cleaning up");
+  exploring_timer_.reset();
+  move_base_client_.reset();
+  if (visualize_) {
+    marker_array_publisher_.reset();
+  }
+  search_.reset();
+  costmap_client_->cleanup();
+  costmap_client_.reset();
+  return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::
+      CallbackReturn::SUCCESS;
+}
+
+rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+Explore::on_shutdown(const rclcpp_lifecycle::State & state)
+{
+  RCLCPP_INFO(logger_, "Shutting down from state %s", state.label().c_str());
+  return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::
+      CallbackReturn::SUCCESS;
 }
 
 void Explore::visualizeFrontiers(
@@ -168,7 +228,7 @@ void Explore::visualizeFrontiers(
   std::vector<visualization_msgs::msg::Marker>& markers = markers_msg.markers;
   visualization_msgs::msg::Marker m;
 
-  m.header.frame_id = costmap_client_.getGlobalFrameID();
+  m.header.frame_id = costmap_client_->getGlobalFrameID();
   m.header.stamp = this->now();
   m.ns = "frontiers";
   m.scale.x = 1.0;
@@ -238,10 +298,14 @@ void Explore::visualizeFrontiers(
 
 void Explore::makePlan()
 {
+  if (!costmap_client_->isReady() || !move_base_client_->wait_for_action_server(std::chrono::seconds(1))) {
+    return;
+  }
+
   // find frontiers
-  auto pose = costmap_client_.getRobotPose();
+  auto pose = costmap_client_->getRobotPose();
   // get frontiers sorted according to cost
-  auto frontiers = search_.searchFrom(pose.position);
+  auto frontiers = search_->searchFrom(pose.position);
   RCLCPP_DEBUG(logger_, "found %lu frontiers", frontiers.size());
   for (size_t i = 0; i < frontiers.size(); ++i) {
     RCLCPP_DEBUG(logger_, "frontier %zd cost: %f", i, frontiers[i].cost);
@@ -249,7 +313,7 @@ void Explore::makePlan()
 
   if (frontiers.empty()) {
     RCLCPP_WARN(logger_, "No frontiers found, stopping.");
-    stop(true);
+    this->deactivate();
     return;
   }
 
@@ -266,7 +330,7 @@ void Explore::makePlan()
                        });
   if (frontier == frontiers.end()) {
     RCLCPP_WARN(logger_, "All frontiers traversed/tried out, stopping.");
-    stop(true);
+    this->deactivate();
     return;
   }
   geometry_msgs::msg::Point target_position = frontier->centroid;
@@ -305,7 +369,7 @@ void Explore::makePlan()
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
   goal.pose.pose.position = target_position;
   goal.pose.pose.orientation.w = 1.;
-  goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
+  goal.pose.header.frame_id = costmap_client_->getGlobalFrameID();
   goal.pose.header.stamp = this->now();
 
   auto send_goal_options =
@@ -328,7 +392,7 @@ void Explore::returnToInitialPose()
   auto goal = nav2_msgs::action::NavigateToPose::Goal();
   goal.pose.pose.position = initial_pose_.position;
   goal.pose.pose.orientation = initial_pose_.orientation;
-  goal.pose.header.frame_id = costmap_client_.getGlobalFrameID();
+  goal.pose.header.frame_id = costmap_client_->getGlobalFrameID();
   goal.pose.header.stamp = this->now();
 
   auto send_goal_options =
@@ -339,7 +403,7 @@ void Explore::returnToInitialPose()
 bool Explore::goalOnBlacklist(const geometry_msgs::msg::Point& goal)
 {
   constexpr static size_t tolerace = 5;
-  nav2_costmap_2d::Costmap2D* costmap2d = costmap_client_.getCostmap();
+  nav2_costmap_2d::Costmap2D* costmap2d = costmap_client_->getCostmap();
 
   // check if a goal is on the blacklist for goals that we're pursuing
   for (auto& frontier_goal : frontier_blacklist_) {
@@ -388,45 +452,15 @@ void Explore::reachedGoal(const NavigationGoalHandle::WrappedResult& result,
   makePlan();
 }
 
-void Explore::start()
-{
-  RCLCPP_INFO(logger_, "Exploration started.");
-}
-
-void Explore::stop(bool finished_exploring)
-{
-  RCLCPP_INFO(logger_, "Exploration stopped.");
-  move_base_client_->async_cancel_all_goals();
-  exploring_timer_->cancel();
-
-  if (return_to_init_ && finished_exploring) {
-    returnToInitialPose();
-  }
-}
-
-void Explore::resume()
-{
-  resuming_ = true;
-  RCLCPP_INFO(logger_, "Exploration resuming.");
-  // Reactivate the timer
-  exploring_timer_->reset();
-  // Resume immediately
-  makePlan();
-}
-
 }  // namespace explore
 
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
-  // ROS1 code
-  /*
-  if (ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME,
-                                     ros::console::levels::Debug)) {
-    ros::console::notifyLoggerLevelsChanged();
-  } */
-  rclcpp::spin(
-      std::make_shared<explore::Explore>());  // std::move(std::make_unique)?
+  rclcpp::executors::SingleThreadedExecutor executor;
+  auto node = std::make_shared<explore::Explore>(rclcpp::NodeOptions());
+  executor.add_node(node->get_node_base_interface());
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

@@ -45,8 +45,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <map_msgs/msg/occupancy_grid_update.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
-#include <rclcpp/rclcpp.hpp>
-
+#include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 
 namespace explore
@@ -63,7 +62,18 @@ public:
    * @param node node handle to retrieve parameters from
    * @param tf_listener Will be used for transformation of robot pose.
    */
-  Costmap2DClient(rclcpp::Node& node, const tf2_ros::Buffer* tf_listener);
+  Costmap2DClient(rclcpp_lifecycle::LifecycleNode& node,
+                  const tf2_ros::Buffer* tf_listener,
+                  const std::string& costmap_topic,
+                  const std::string& costmap_updates_topic,
+                  const std::string& robot_base_frame,
+                  double transform_tolerance);
+
+  void configure();
+
+  void cleanup();
+
+  bool isReady();
   /**
    * @brief Get the pose of the robot in the global frame of the costmap
    * @return pose of the robot in the global frame of the costmap
@@ -120,12 +130,14 @@ protected:
 
   const tf2_ros::Buffer* const tf_;  ///< @brief Used for transforming
                                      /// point clouds
-  rclcpp::Node& node_;
+  rclcpp_lifecycle::LifecycleNode& node_;
   std::string global_frame_;      ///< @brief The global frame for the costmap
   std::string robot_base_frame_;  ///< @brief The frame_id of the robot base
   double transform_tolerance_;    ///< timeout before transform errors
 
 private:
+  std::string costmap_topic_;
+  std::string costmap_updates_topic_;
   // will be unsubscribed at destruction
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_sub_;
   rclcpp::Subscription<map_msgs::msg::OccupancyGridUpdate>::SharedPtr
